@@ -815,9 +815,9 @@ def main() -> None:
 
     safe_prem_level = find_min_premium_for_years(prem_years, rate_safe, db_option=1)
     if supports_ansi():
-        print(f"\n\n\033[3mFor reference: a guaranteed rate of {safe_rate_in:.0f}% would require {prem_years} premiums of {abbrev_money(safe_prem_level)}.\033[0m")
+        print(f"\n\033[3mFor reference: a guaranteed rate of {safe_rate_in:.0f}% would require {prem_years} premiums of {abbrev_money(safe_prem_level)}.\033[0m\n")
     else:
-        print(f"\n\nFor reference: a guaranteed rate of {safe_rate_in:.0f}% would require {prem_years} premiums of {abbrev_money(safe_prem_level)}.")
+        print(f"\nFor reference: a guaranteed rate of {safe_rate_in:.0f}% would require {prem_years} premiums of {abbrev_money(safe_prem_level)}.\n")
 
         # --- ALT (Alternative Investment) flow ---
     cg_inclusion = load_cg_inclusion(province)
@@ -866,7 +866,7 @@ def main() -> None:
             rr = float(read_input("   Annual rate of return: ", "10.0").strip() or "10.0")
             ad = float(read_input("\n3) Deferred CG allocation: ", "20").strip() or "20")
             rd = float(read_input("   Annual rate of return: ", "7.0").strip() or "7.0")
-            rb = read_input("\nRebalancing? (1 = Annual, 2 = Off)): ", "1").strip()
+            rb = read_input("\nRebalancing? (1 = Annual, 2 = Off): ", "1").strip()
 
             total_alloc = ai + ar + ad
             if abs(total_alloc - 100.0) > 1e-6:
