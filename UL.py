@@ -1,19 +1,19 @@
 # UL.py — Universal Life monthly projection + two sales tables (Level & Sum+Fund)
 # Files required next to UL.py:
-#   - COI.csv  (columns: PolicyYear, and e.g. YRT70-F30, YRT70-F30S, YRT85-M45, LEVEL-F30, ...)
-#   - TAX.csv  (Province, PremiumTaxPercent) for QC/ON/BC
+#   - Tables/COI.csv       (columns: PolicyYear, and e.g. YRT70-F30, YRT70-F30S, YRT85-M45, LEVEL-F30, ...)
+#   - Tables/Tax_Rates.csv (Province + premium tax rate; flexible headers/units)
 #
 # I/O:
-# - Prompts: Province → Gender → Age → Smoker → Face Amount → COI Type → Premium Years → Base Rate → Safe Rate
+# - Prompts: Province → Client Type → Gender → Age → Smoker → Face Amount → COI Type → Premium Years → Base Rate → Safe Rate
 # - Prints two tables:
 #     Level Death Benefit (constant DB): same premium at Base/+1%/+2% where +1/+2% solve for Years
-#     Sum + Fund (growing DB): keeps the same number of premium years, but shows how DB increases at +1% and +2%.
-#   Columns: Premium | Rate | Years | Paid-Up Age | DB @ 85 | Tax-Free IRR | Tax-Equivalent IRR
-#   Safe-rate “For reference” line printed under the Level table only
-# - Writes UL_Projection.csv (monthly detail for the Level/Base case)
+#     Sum + Fund (growing DB): keeps the same # of premium years, but shows how DB increases at +1% and +2%.
+# - Writes annual CSVs:
+#     LEVEL_Data.csv  : Year, Age, Deposit, Income, Cost, Fund Value, Face Value
+#     LEVEL_Report.csv: same; if Client Type = Corporate adds a blank NCPI column (to be filled later)
 #
 # Notes:
-# - Keeps prior math/formatting intact; improves structure, clarity, and minor speed-ups.
+# - Keeps prior math/formatting intact; improves structure & resiliency. No UL_Projection.csv written anymore.
 
 from __future__ import annotations
 
@@ -144,6 +144,75 @@ def _stop_dots() -> None:
         sys.stdout.write("\r" + " " * 40 + "\r")
         sys.stdout.flush()
 
+# ---------- Load premium tax from Tables/Tax_Rates.csv ----------
+def load_premium_tax(province_code: str, default: float = 0.033) -> float:
+    """
+    Returns the premium tax rate as a decimal (e.g., 0.033 for 3.3%).
+    Flexible with column names/units in Tax_Rates.csv.
+
+    Expected location: ./Tables/Tax_Rates.csv
+    Recognized columns (any one is fine):
+      - Province   (QC/ON/BC, case-insensitive; trims spaces)
+      - PremiumTaxPercent  OR  Premium_Tax_Percent  OR  Premium_Tax_Rate  OR  PremiumTaxRate
+        Values may be in percent (3.3) or decimal (0.033).
+    """
+    try:
+        tax_path = Path(__file__).parent / "Tables" / "Tax_Rates.csv"
+        if not tax_path.exists():
+            return default
+
+        df_tax = pd.read_csv(tax_path)
+        df_tax.columns = [str(c).strip() for c in df_tax.columns]
+
+        # Province column
+        prov_col_candidates = [c for c in df_tax.columns if c.lower() in {"province", "prov"}]
+        if not prov_col_candidates:
+            return default
+        prov_col = prov_col_candidates[0]
+        df_tax[prov_col] = df_tax[prov_col].astype(str).str.strip().str.upper()
+
+        # Rate column candidates
+        rate_candidates = []
+        for c in df_tax.columns:
+            lc = c.lower()
+            if any(k in lc for k in ["premiumtaxpercent", "premium_tax_percent", "premium_tax_rate", "premiumtaxrate"]):
+                rate_candidates.append(c)
+        if not rate_candidates:
+            # Fall back to any column that looks numeric and NOT the province col
+            rate_candidates = [c for c in df_tax.columns if c != prov_col]
+
+        # Take the first numeric-looking candidate
+        rate_col = None
+        for c in rate_candidates:
+            try:
+                vals = pd.to_numeric(df_tax[c], errors="coerce")
+                if vals.notna().mean() > 0.7:
+                    rate_col = c
+                    df_tax[c] = vals
+                    break
+            except Exception:
+                continue
+        if rate_col is None:
+            return default
+
+        row = df_tax.loc[df_tax[prov_col] == province_code]
+        if row.empty:
+            return default
+
+        val = float(row.iloc[0][rate_col])
+
+        # If value looks like a percent (e.g., 3.3), convert to decimal
+        if val > 1.0:
+            val = val / 100.0
+
+        # Sanity clamp
+        if not (0.0 <= val < 0.25):
+            return default
+
+        return val
+    except Exception:
+        return default
+
 # ---------- Core ----------
 def main() -> None:
     print("\n--- Please Enter Policy Details ---\n")
@@ -151,20 +220,23 @@ def main() -> None:
     def ask_int(prompt: str) -> int:   return int(input(prompt).strip())
     def ask_float(prompt: str) -> float: return float(input(prompt).strip())
 
-    prov_choice   = ask_int("Province (1=QC, 2=ON, 3=BC): ")
+    prov_choice   = ask_int("Province (1=QC, 2=ON): ")
+    client_choice = ask_int("Ownership (1=Corp, 2=Personal): ")
     gender_choice = ask_int("Gender (1=Male, 2=Female): ")
     age_input     = ask_int("Issue Age (e.g., 30): ")
     smoker_choice = ask_int("Smoker? (1=Non-Smoker, 2=Smoker): ")
 
     face_amount   = ask_float("Face Amount (e.g., 10000000): ")
-    coi_choice    = ask_int("COI Type (1=YRT70, 2=YRT85, 3=LEVEL100): ")
+    coi_choice    = ask_int("COI Type (1=YRT70, 2=YRT85, 3=L100): ")
     prem_years    = ask_int("Planned Premium Years (e.g., 20): ")
     base_rate_in  = ask_float("Base Annual Rate (e.g., 4.25): ")
-    safe_rate_in  = ask_float("Safe/Guaranteed Rate (e.g., 2.00): ")
+    safe_rate_in  = ask_float("Guaranteed Rate (e.g., 2.00): ")
 
     # Derived selections
-    prov_map = {1: "QC", 2: "ON", 3: "BC"}
+    prov_map = {1: "QC", 2: "ON"}
     province = prov_map.get(prov_choice, "QC")
+
+    client_type = "Corporate" if client_choice == 1 else "Personal"
 
     gender      = "M" if gender_choice == 1 else "F"
     smk_suf     = "S" if smoker_choice == 2 else ""
@@ -176,23 +248,8 @@ def main() -> None:
     rate_base = base_rate_in / 100.0
     rate_safe = safe_rate_in / 100.0
 
-    # Load TAX.csv
-    def load_premium_tax(default: float = 0.033) -> float:
-        tax_path = Path(__file__).parent / "Tables" / "TAX.csv"
-        if not tax_path.exists():
-            return default
-        try:
-            tx = pd.read_csv(tax_path)
-            tx["Province"] = tx["Province"].astype(str).str.strip().str.upper()
-            row = tx.loc[tx["Province"] == province]
-            if row.empty:
-                return default
-            pct = float(row["PremiumTaxPercent"].iloc[0])
-            return pct / 100.0
-        except Exception:
-            return default
-
-    premium_tax_rate = load_premium_tax()
+    # Premium tax
+    premium_tax_rate = load_premium_tax(province)
 
     # Load COI.csv
     status("Calculating ...")
@@ -226,7 +283,7 @@ def main() -> None:
     coi_df[coi_key] = pd.to_numeric(coi_df[coi_key], errors="coerce").fillna(0.0)
 
     clear_status()
-    print(f"\nProvince: {province} | Premium Tax: {premium_tax_rate*100:.2f}%")
+    print(f"\nProvince: {province} | Premium Tax: {premium_tax_rate*100:.2f}% | Client: {client_type}")
     print(f"COI Column: {coi_key}")
 
     # Start three-dot animation here (slow section)
@@ -247,7 +304,7 @@ def main() -> None:
         row = coi_df.loc[coi_df["PolicyYear"] == policy_year]
         return float((row[coi_key].iloc[0] if not row.empty else coi_df[coi_key].iloc[-1]))
 
-    # Engines (INSIDE main)
+    # -------- Simulation engine (monthly) --------
     def simulate_monthly(annual_prem: float, prem_years_int: int, annual_rate: float, db_option: int) -> Tuple[pd.DataFrame, int]:
         """
         Detailed monthly projection with TAX column.
@@ -289,7 +346,7 @@ def main() -> None:
                 coi_rate_ann,        # COI_Rate (annual per 1,000)
                 coi_month,           # COI (monthly)
                 fv_net,              # FV_Net
-                annual_rate,         # AnnualRate (decimal, e.g., 0.0425)
+                annual_rate,         # AnnualRate (decimal)
                 growth,              # Growth (monthly)
                 fv_eoy               # FV_EOY
             ))
@@ -339,11 +396,13 @@ def main() -> None:
 
     def find_min_premium_for_years(years_int: int, annual_rate: float, db_option: int) -> int:
         low, high = 0.0, 1.0
+        # Expand upper bound
         for _ in range(40):
             df, _ = simulate_monthly(high, years_int, annual_rate, db_option)
             ok = (last_m <= 0) or (float(df.iloc[last_m - 1]["FV_EOY"]) >= 0)
             if ok: break
             high *= 2.0
+        # Bisection
         for _ in range(80):
             mid = (low + high) / 2.0
             df, _ = simulate_monthly(mid, years_int, annual_rate, db_option)
@@ -411,7 +470,7 @@ def main() -> None:
         ]
         return rows, safe_prem_ref, base_prem
 
-            # -------- pretty, fixed-width table printer --------
+    # -------- pretty, fixed-width table printer --------
     def print_table(title: str, rows: List[Tuple]) -> None:
         print("\n" + title)
 
@@ -432,8 +491,8 @@ def main() -> None:
 
         for prem, rate_pct, yrs, pu_age, db85, irr_tf, irr_te in rows:
             cells = [
-                f"{abbrev_money(prem):<{cols[0][1]}}",           # LEFT-aligned
-                f"{rate_pct:>{cols[1][1]-1}.2f}%",               # RIGHT-aligned
+                f"{abbrev_money(prem):<{cols[0][1]}}",
+                f"{rate_pct:>{cols[1][1]-1}.2f}%",
                 f"{str(yrs):>{cols[2][1]}}",
                 f"{pu_age:>{cols[3][1]}}",
                 f"{abbrev_money(db85):>{cols[4][1]}}",
@@ -442,65 +501,55 @@ def main() -> None:
             ]
             print(" | ".join(cells))
 
-
     # Heavy work (ensure dots always stop)
     try:
+        # LEVEL table + monthly baseline
         rows_level, safe_prem_level, base_prem_level = build_table(db_option=1)
         df_level_base, _ = simulate_monthly(base_prem_level, prem_years, rate_base, db_option=1)
-        Path(script_dir).joinpath("UL_Projection.csv").write_text(df_level_base.to_csv(index=False))
 
-        # ------------------- LEVEL_Data.csv (main monthly data) -------------------
-        df_level_base, _ = simulate_monthly(base_prem_level, prem_years, rate_base, db_option=1)
-        df_level_base.to_csv(Path(script_dir) / "LEVEL_Data.csv", index=False)
-
-        # ------------------- LEVEL_Report.csv (annual summary) -------------------
+        # -------- Annual CSVs from monthly LEVEL base-case --------
         ann = df_level_base.copy()
-
         # Ensure numeric types
-        for c in ["Year", "Deposit", "TAX", "COI", "Growth", "FV_EOY"]:
+        to_num = ["Year", "Deposit", "TAX", "COI", "NAAR", "COI_Rate", "Growth", "FV_EOY"]
+        for c in to_num:
             ann[c] = pd.to_numeric(ann[c], errors="coerce").fillna(0.0)
 
-        # Aggregate annually
+        # Annual aggregates
         sums = ann.groupby("Year", as_index=False)[["Deposit", "TAX", "COI", "Growth"]].sum()
         last = ann.groupby("Year", as_index=False)[["FV_EOY"]].last()
+
         annual = sums.merge(last, on="Year", how="left")
-
-        # Derived columns
-        annual["Age"] = start_age + annual["Year"] - 1
-        annual["Income"] = annual["Growth"]
-        annual["Cost"] = annual["TAX"] + annual["COI"]
-        annual["Fund Value"] = annual["FV_EOY"]
+        annual["Age"]        = (start_age + annual["Year"] - 1).astype(int)
+        annual["Cost"]       = (annual["COI"] + annual["TAX"]).astype(float)
+        annual["Fund Value"] = annual["FV_EOY"].astype(float)
         annual["Face Value"] = float(face_amount)
-        annual["NCPI"] = ""  # blank for now
+        annual["Deposit"]    = annual["Deposit"].astype(float)
+        annual["Income"]     = annual["Growth"].astype(float)
 
-        # Final column order
-        out = annual[[
-            "Year",
-            "Age",
-            "Deposit",
-            "Income",
-            "Cost",
-            "Fund Value",
-            "Face Value",
-            "NCPI"
-        ]].copy()
+        # Order & round for LEVEL_Data.csv
+        out_data_cols = ["Year", "Age", "Deposit", "Income", "Cost", "Fund Value", "Face Value"]
+        out_data = annual[out_data_cols].copy()
+        out_data[["Deposit","Income","Cost","Fund Value","Face Value"]] = (
+            out_data[["Deposit","Income","Cost","Fund Value","Face Value"]].round(2)
+        )
 
-        # Rounding
-        out = out.round({
-            "Deposit": 2,
-            "Income": 2,
-            "Cost": 2,
-            "Fund Value": 2,
-            "Face Value": 2
-        })
+        # Write LEVEL_Data.csv
+        (Path(script_dir) / "LEVEL_Data.csv").write_text(out_data.to_csv(index=False))
 
-        # Save
-        (Path(script_dir) / "LEVEL_Report.csv").write_text(out.to_csv(index=False))
+        # LEVEL_Report.csv:
+        #   - Personal: same as LEVEL_Data (no NCPI)
+        #   - Corporate: same columns + empty NCPI column
+        if client_type == "Corporate":
+            out_report = out_data.copy()
+            out_report["NCPI"] = ""  # blank for your teammate to fill
+            cols_with_ncpi = out_data_cols + ["NCPI"]
+            (Path(script_dir) / "LEVEL_Report.csv").write_text(out_report[cols_with_ncpi].to_csv(index=False))
+        else:
+            (Path(script_dir) / "LEVEL_Report.csv").write_text(out_data.to_csv(index=False))
 
-
-          
-
+        # FUND+ table for the console
         rows_sf, _, _ = build_table(db_option=2)
+
     except Exception as e:
         _stop_dots()
         print("\nERROR:", e)
@@ -509,26 +558,22 @@ def main() -> None:
     finally:
         _stop_dots()
 
-        head_level = (
-        f"UL (LEVEL) / {gender}{start_age} {smk_display} / {coi_type}\n"
+    # ---- Pretty console output ----
+    head_level = (
+        f"UL (LEVEL) / {('Male' if gender=='M' else 'Female')}{start_age} {smk_display} / {coi_type}\n"
         f"Annual Premium: ${base_prem_level:,.0f}"
     )
-        head_sf = (
-        f"UL (FUND+) / {gender}{start_age} {smk_display} / {coi_type}\n"
+    head_sf = (
+        f"UL (FUND+) / {('Male' if gender=='M' else 'Female')}{start_age} {smk_display} / {coi_type}\n"
         f"Annual Premium: ${rows_sf[0][0]:,.0f}"
     )
 
-
-
-
     print_table(head_level, rows_level)
-    # Safe-rate reference line (Level only)
     print(f"\nFor reference (Level): a guaranteed return of {safe_rate_in:.2f}% for {prem_years} premiums would require an annual premium of {abbrev_money(safe_prem_level)}.")
-
     print_table(head_sf, rows_sf)
 
-    print(f"\nProvince = {'Quebec' if province=='QC' else 'Ontario' if province=='ON' else 'British Columbia'}")
-    print("\n(Detailed monthly projection for LEVEL base case saved to UL_Projection.csv)\n")
+    print(f"\nProvince = {'Quebec' if province=='QC' else 'Ontario' if province=='ON' else 'British Columbia'} | Client = {client_type}")
+    print("\n(Annual CSVs saved: LEVEL_Data.csv and LEVEL_Report.csv)\n")
 
 if __name__ == "__main__":
     main()
