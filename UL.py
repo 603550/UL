@@ -70,6 +70,13 @@ def coi_limit_age(kind: str) -> int:
 def last_coi_months(start_age: int, kind: str) -> int:
     return max(0, coi_limit_age(kind) - start_age) * 12
 
+def _no_lapse(df_monthly: pd.DataFrame, horizon_months: int) -> bool:
+    """True if FV_EOY never goes negative up to horizon_months."""
+    if horizon_months <= 0:
+        return True
+    return float(df_monthly["FV_EOY"].iloc[:horizon_months].min()) >= 0.0
+
+
 # ---------- Robust IRR ----------
 
 def irr(cashflows: List[float], lo: float = -0.9999, hi: float = 4.0, tol: float = 1e-7, max_iter: int = 200) -> float:
@@ -300,8 +307,10 @@ def main() -> None:
     coi_df[coi_key] = pd.to_numeric(coi_df[coi_key], errors="coerce").fillna(0.0)
 
     clear_status()
-    print(f"\nProvince: {province} | Premium Tax: {premium_tax_rate*100:.2f}% | Client: {client_type}")
-    print(f"COI Column: {coi_key}")
+    # print(f"\nProvince: {province} | Premium Tax: {premium_tax_rate*100:.2f}% | Client: {client_type}")
+    # print(f"COI Column: {coi_key}")
+    print(f"\nPOLICY REPORT ({'QC' if province=='QC' else 'ON' if province=='ON' else province} / {client_type})")
+    print(f"-------------------------------")
 
     _start_dots("Calculating")
 
@@ -391,19 +400,31 @@ def main() -> None:
 
     def find_min_premium_for_years(years_int: int, annual_rate: float, db_option: int) -> int:
         low, high = 0.0, 1.0
+
+        def ok_case(df):
+            horizon = last_m  # require survival through COI charge horizon
+            return _no_lapse(df, horizon)
+
+        # grow upper bound
         for _ in range(40):
             df, _ = simulate_monthly(high, years_int, annual_rate, db_option)
-            ok = (last_m <= 0) or (float(df.iloc[last_m - 1]["FV_EOY"]) >= 0)
-            if ok: break
+            if ok_case(df):
+                break
             high *= 2.0
+
+        # bisection
         for _ in range(80):
             mid = (low + high) / 2.0
             df, _ = simulate_monthly(mid, years_int, annual_rate, db_option)
-            ok = (last_m <= 0) or (float(df.iloc[last_m - 1]["FV_EOY"]) >= 0)
-            if ok: high = mid
-            else:  low = mid
-            if abs(high - low) < 0.01: break
+            if ok_case(df):
+                high = mid
+            else:
+                low = mid
+            if abs(high - low) < 0.01:
+                break
+
         return int(round(high))
+
 
     def find_years_for_same_premium(annual_prem: float, annual_rate: float, db_option: int) -> float:
         lo, hi = 0.0, 1.0
@@ -502,15 +523,16 @@ def main() -> None:
             return rows, None, base_prem, notes
 
     def print_table_four_rates(title: str, rows: List[Tuple], notes: List[str]) -> None:
-        print("\n" + title)
+        if title.strip():
+            print(title)
         cols = [
             ("Rate Case",        9),
-            ("Premium",         10),
             ("Rate",             7),
+            ("Premium",         10),
             ("Years",            7),
             ("Paid-Up",         10),
             ("DB @ 85",         12),
-            ("Tax-Free IRR",    13),
+            ("After-Tax IRR",    13),
             ("Pre-Tax IRR",     13),
         ]
         header = " | ".join(name.ljust(w) for name, w in cols)
@@ -523,18 +545,23 @@ def main() -> None:
             irr_te_str = f"{irr_te*100:>{cols[7][1]-1}.2f}%" if irr_te is not None else " " * (cols[7][1]-3) + "N/A"
             cells = [
                 f"{label:<{cols[0][1]}}",
-                f"{abbrev_money(prem):<{cols[1][1]}}",
-                f"{rate_pct:>{cols[2][1]-1}.2f}%",
+                f"{rate_pct:>{cols[1][1]-1}.2f}%",
+                f"{abbrev_money(prem):<{cols[2][1]}}",
                 f"{str(yrs):>{cols[3][1]}}",
                 f"{pu_age:>{cols[4][1]}}",
                 db_str,
                 irr_tf_str,
                 irr_te_str,
             ]
-            print(" | ".join(cells))
+            if supports_ansi() and label == "Target":
+                # Bold and light green for visibility
+                print("\033[1;32m" + " | ".join(cells) + "\033[0m")
+            else:
+                print(" | ".join(cells))
 
         if notes:
             print("\nNotes: " + " | ".join(notes))
+
 
     # ---- Main compute & CSV generation ----
     try:
@@ -600,7 +627,7 @@ def main() -> None:
             )
 
         # FUND+ table (console only)
-        rows_sf, _, base_prem_fund, notes_sf = build_table_four_rates(db_option=2)
+        # rows_sf, _, base_prem_fund, notes_sf = build_table_four_rates(db_option=2)
 
     except Exception as e:
         _stop_dots()
@@ -611,20 +638,33 @@ def main() -> None:
         _stop_dots()
 
     # ---- Console tables ----
-    head_level = (
-        f"UL (LEVEL) / {('Male' if gender=='M' else 'Female')}{start_age} {smk_display} / {coi_type}\n"
-        f"Annual Premium: ${base_prem_level:,.0f}"
-    )
-    head_sf = (
-        f"UL (FUND+) / {('Male' if gender=='M' else 'Female')}{start_age} {smk_display} / {coi_type}\n"
-        f"Annual Premium: ${base_prem_fund:,.0f}"
-    )
+    # ---- Console tables ----
+    if supports_ansi():
+        print(f"\n\033[1;97m${face_amount/1_000_000:.0f}M UL (LEVEL) / {('M' if gender=='M' else 'F')}{start_age} {smk_display} / {coi_type}")
+        print(f"ANNUAL PREMIUM: ${base_prem_level:,.0f}\033[0m\n")
+    else:
+        print(f"\n${face_amount/1_000_000:.0f}M UL (LEVEL) / {('M' if gender=='M' else 'F')}{start_age} {smk_display} / {coi_type}")
+        print(f"ANNUAL PREMIUM: ${base_prem_level:,.0f}\n")
 
-    print_table_four_rates(head_level, rows_level, notes_level)
-    print_table_four_rates(head_sf, rows_sf, notes_sf)
 
-    print(f"\nProvince = {'Quebec' if province=='QC' else 'Ontario' if province=='ON' else province} | Client = {client_type}")
-    print("\n(Files saved: LEVEL_Data.csv [monthly] and LEVEL_Report.csv [annual])\n")
+   # head_sf = (
+   #     f"UL (FUND+) / {('Male' if gender=='M' else 'Female')}{start_age} {smk_display} / {coi_type}\n"
+   #     f"Annual Premium: ${base_prem_fund:,.0f}"
+   # )
+
+    # after the two heading prints
+    print_table_four_rates("", rows_level, [])
+
+    # print_table_four_rates(head_sf, rows_sf, notes_sf)
+
+    # Guaranteed (safe) rate reference line
+    safe_prem_level = find_min_premium_for_years(prem_years, rate_safe, db_option=1)
+    if supports_ansi():
+        print(f"\n\n\033[3mFor reference: a guaranteed rate of {safe_rate_in:.0f}% would require {prem_years} premiums of {abbrev_money(safe_prem_level)}.\033[0m\n\n")
+    else:
+        print(f"\n\nFor reference: a guaranteed rate of {safe_rate_in:.0f}% would require {prem_years} premiums of {abbrev_money(safe_prem_level)}.\n\n")
+
+    
 
 if __name__ == "__main__":
     main()
