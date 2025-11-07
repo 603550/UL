@@ -7,14 +7,11 @@
 # - Prompts: Province → Ownership → Gender → Age → Smoker → Face → COI Type → Premium Years → Base Rate → Safe Rate
 # - Prints one table (Level DB) at four rates: Base−1%, Base, Base+1%, Base+2%.
 # - Writes CSVs from the LEVEL base-case monthly sim:
-#     LEVEL_Data.csv   : monthly rows (unchanged): Year, Month, FV_BOY, Deposit, TAX, FV1, FaceValue, NAAR,
-#                        COI_Rate, COI, FV_Net, AnnualRate, Growth, FV_EOY
-#     LVL_Report.csv   : annual summary (EOY ages):
-#         Corporate → Year, Age, Deposit, Income, Cost, Fund Value, Face Value, NCPI(blank)
-#         Personal  → Year, Age, Deposit, Income, Cost, Fund Value, Face Value, IRR, TE IRR
+#     Reports/LEVEL_Data.csv
+#     Reports/LVL_Report.csv
 # - ALT_Report.csv     : Alternative investment scenario (same premium & years as LEVEL Target) with:
-#         Year, Age, Deposit, Gross income, Tax, Accrued RTax deferred, Fund Value before deferred,
-#         Net Fund Value After Tax, After-Tax IRR
+#     Reports/ALT_Report.csv
+#     Reports/ALT_Rebalance.csv (if rebalancing ON; detailed ledger)
 #
 # Notes:
 # - IRR per year is computed as of EOY of each policy year using negative deposits paid up to that year
@@ -104,8 +101,6 @@ def ask_float_default(prompt: str, default: float) -> float:
             return float(s)
         except ValueError:
             print("Please enter a number.")
-
-
 
 # ---------- Robust IRR ----------
 
@@ -309,22 +304,10 @@ def run_alt_report(
     alloc_deferred_rate: float,
     out_path: Path,
     rebalancing: bool = True,
+    rebalance_log_path: Optional[Path] = None,
 ) -> Tuple[pd.DataFrame, float]:
     """
-    ALT scenario using same annual premium & number of premiums as LEVEL Target.
-
-    If rebalancing=True:
-      - BOY (after deposit) rebalance to fixed weights (e.g., 50%/25%/25%).
-      - Interest income taxed annually at personal rate.
-      - Realized CG taxed annually at personal * CG_Inclusion.
-      - Deferred CG accrues deferred tax liability (personal * CG_Inclusion); no current tax.
-      - Net After Tax = Sum balances − cumulative deferred tax liability.
-
-    If rebalancing=False:
-      - BOY deposit split by weights; sleeves compound without rebalancing.
-      - Same tax treatment per sleeve.
-
-    ALT_Report.csv columns are rounded to cents; includes per-year After-Tax IRR.
+    ALT scenario; also emits a detailed annual rebalance log if `rebalance_log_path` is provided.
     """
     years = max(1, horizon_age - start_age)
 
@@ -339,43 +322,76 @@ def run_alt_report(
     rR = alloc_realized_rate if alloc_realized_rate <= 1 else alloc_realized_rate/100.0
     rD = alloc_deferred_rate if alloc_deferred_rate <= 1 else alloc_deferred_rate/100.0
 
+    # Balances at end of previous year (start at 0)
     bal_I = bal_R = bal_D = 0.0
-    deferred_tax_cum = 0.0  # positive liability
+    deferred_tax_cum = 0.0  # running liability
 
-    rows = []
+    # Summary rows (existing ALT_Report)
+    sum_rows = []
+
+    # Detailed rebalance ledger rows
+    log_rows = []
+
     for yr in range(1, years + 1):
         age = start_age + yr
         dep = annual_prem if yr <= prem_years else 0.0
 
-        if rebalancing:
-            total_boy = bal_I + bal_R + bal_D + dep
-            bal_I = total_boy * aI
-            bal_R = total_boy * aR
-            bal_D = total_boy * aD
-        else:
-            bal_I += dep * aI
-            bal_R += dep * aR
-            bal_D += dep * aD
+        # --- BOY state BEFORE deposit/rebalance for the log
+        boy_I, boy_R, boy_D = bal_I, bal_R, bal_D
+        boy_total = boy_I + boy_R + boy_D
 
+        # --- Apply deposit at BOY
+        if rebalancing:
+            # Deposit added to total, then rebalance to fixed weights
+            total_boy_after_dep = boy_total + dep
+            tgt_I = total_boy_after_dep * aI
+            tgt_R = total_boy_after_dep * aR
+            tgt_D = total_boy_after_dep * aD
+
+            # Trades to move current balances to target
+            trade_I = tgt_I - (boy_I + 0.0)
+            trade_R = tgt_R - (boy_R + 0.0)
+            trade_D = tgt_D - (boy_D + 0.0)
+            # After trades, new starting balances for the return period:
+            bal_I, bal_R, bal_D = tgt_I, tgt_R, tgt_D
+
+        else:
+            # No rebalancing: deposit split by weights; no trades
+            dep_I = dep * aI
+            dep_R = dep * aR
+            dep_D = dep * aD
+            bal_I = boy_I + dep_I
+            bal_R = boy_R + dep_R
+            bal_D = boy_D + dep_D
+
+            tgt_I = bal_I
+            tgt_R = bal_R
+            tgt_D = bal_D
+            trade_I = trade_R = trade_D = 0.0
+
+        # --- In-year returns and taxes
         inc_I = bal_I * rI
         inc_R = bal_R * rR
         inc_D = bal_D * rD
 
         tax_I = inc_I * tax_rate
         tax_R = inc_R * tax_rate * cg_inclusion
-        tax_current = -(tax_I + tax_R)
+        tax_current = -(tax_I + tax_R)  # negative (cash out for taxes)
 
+        # Apply taxes where they’re generated
         bal_I += inc_I - tax_I
         bal_R += inc_R - tax_R
         bal_D += inc_D
 
-        accr_deferred = -(inc_D * tax_rate * cg_inclusion)
-        deferred_tax_cum += -accr_deferred
+        # Deferred capital gains tax accrual on the deferred sleeve
+        accr_deferred = -(inc_D * tax_rate * cg_inclusion)      # negative number (liability increases)
+        deferred_tax_cum += -accr_deferred                      # store as positive liability
 
         fund_before_deferred = bal_I + bal_R + bal_D
         net_after_tax = fund_before_deferred - deferred_tax_cum
 
-        rows.append((
+        # --- Summary row (existing ALT_Report)
+        sum_rows.append((
             yr, age, dep,
             inc_I + inc_R + inc_D,
             tax_current,
@@ -384,36 +400,47 @@ def run_alt_report(
             net_after_tax
         ))
 
-    df = pd.DataFrame(rows, columns=[
+        # --- Detailed log row
+        log_rows.append((
+            yr, age,
+            round(boy_I, 10), round(boy_R, 10), round(boy_D, 10), round(boy_total, 10),
+            dep,
+            aI, aR, aD,
+            round(tgt_I, 10), round(tgt_R, 10), round(tgt_D, 10),
+            round(trade_I, 10), round(trade_R, 10), round(trade_D, 10),
+            inc_I, inc_R, inc_D,
+            -tax_I, -tax_R,               # make taxes positive in the CSV
+            -accr_deferred,               # positive accrual amount
+            bal_I, bal_R, bal_D,
+            fund_before_deferred,
+            deferred_tax_cum,
+            net_after_tax
+        ))
+
+    # Build the main summary DataFrame
+    df = pd.DataFrame(sum_rows, columns=[
         "Year","Age","Deposit","Gross income","Tax","Accrued RTax deferred",
         "Fund Value before deferred","Net Fund Value After Tax"
     ])
 
-    # Per-year After-Tax IRR (EOY): use all years to date (including zeros)
+    # Per-year After-Tax IRR (EOY), preserving timing (zeros kept)
     deposits = df["Deposit"].astype(float).tolist()
     net_vals = df["Net Fund Value After Tax"].astype(float).tolist()
-
     irr_series: List[str] = []
     neg_flows: List[float] = []
-
     for i in range(len(df)):
         dep = float(deposits[i])
-        # keep zero years so time isn't compressed
         neg_flows.append(-dep if dep != 0 else 0.0)
-
-        flows = neg_flows[: i+1]              # include zeros to preserve timing
-        # need at least one negative and a positive terminal value
+        flows = neg_flows[: i+1]
         if not any(cf < 0 for cf in flows) or net_vals[i] <= 0:
             irr_series.append("")
             continue
-
-        flows = flows + [float(net_vals[i])]  # terminal inflow at end of year i+1
+        flows = flows + [float(net_vals[i])]
         r = irr(flows)
         irr_series.append(f"{r*100:.2f}%" if np.isfinite(r) else "")
-
     df["After-Tax IRR"] = irr_series
 
-    # Round money columns to cents
+    # Round money columns to cents for the main summary
     money_cols = [
         "Deposit","Gross income","Tax","Accrued RTax deferred",
         "Fund Value before deferred","Net Fund Value After Tax"
@@ -421,8 +448,34 @@ def run_alt_report(
     for c in money_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce").round(2)
 
+    # Write main summary
     out_path.write_text(df.to_csv(index=False))
+
+    # Build and write the detailed rebalance log
+    if rebalance_log_path is not None:
+        log_cols = [
+            "Year","Age",
+            "BOY_I","BOY_R","BOY_D","BOY_Total",
+            "Deposit",
+            "Target_W_I","Target_W_R","Target_W_D",
+            "Target_$ _I","Target_$ _R","Target_$ _D",
+            "Trade_I","Trade_R","Trade_D",
+            "Inc_I","Inc_R","Inc_D",
+            "Tax_I_Paid","Tax_R_Paid","Deferred_CG_Tax_Accrued",
+            "EOY_I","EOY_R","EOY_D",
+            "Fund_Before_Deferred","Deferred_Tax_Cum","Net_After_Tax"
+        ]
+        log_df = pd.DataFrame(log_rows, columns=log_cols)
+
+        # Round dollar columns to cents (leave weights as-is)
+        dollar_cols = [c for c in log_cols if c not in ["Year","Age","Target_W_I","Target_W_R","Target_W_D"]]
+        for c in dollar_cols:
+            log_df[c] = pd.to_numeric(log_df[c], errors="coerce").round(2)
+
+        rebalance_log_path.write_text(log_df.to_csv(index=False))
+
     return df, float(df.iloc[-1]["Net Fund Value After Tax"])
+
 
 # ---------- Core ----------
 
@@ -431,6 +484,12 @@ def main() -> None:
 
     def ask_int(prompt: str) -> int:    return int(input(prompt).strip())
     def ask_float(prompt: str) -> float:return float(input(prompt).strip())
+
+    # --- Paths
+    script_dir = os.path.dirname(__file__)
+    settings_dir = Path(script_dir) / "Settings"
+    reports_dir  = Path(script_dir) / "Reports"
+    reports_dir.mkdir(exist_ok=True)
 
     prov_choice   = ask_int_default("Province (1=QC, 2=ON): ", 1)
     client_choice = ask_int_default("Ownership (1=Corp, 2=Personal): ", 2)
@@ -444,7 +503,6 @@ def main() -> None:
     base_rate_in  = ask_float_default("Base Annual Rate (e.g., 5.25): ", 5.25)
     safe_rate_in  = ask_float_default("Guaranteed Rate (e.g., 2.00): ", 2.00)
 
-
     prov_map = {1: "QC", 2: "ON"}
     province = prov_map.get(prov_choice, "QC")
     client_type = "Corporate" if client_choice == 1 else "Personal"
@@ -457,11 +515,8 @@ def main() -> None:
     rate_base   = base_rate_in / 100.0
     rate_safe   = safe_rate_in / 100.0
 
-    premium_tax_rate  = load_premium_tax(province)
-    personal_tax_rate = load_personal_tax_rate(province)
-
+    # --- Load taxes
     status("Calculating ...")
-    script_dir = os.path.dirname(__file__)
     coi_path = Path(script_dir) / "Tables" / "COI.csv"
     try:
         coi_df = pd.read_csv(coi_path)
@@ -476,6 +531,9 @@ def main() -> None:
         print(f"\nERROR loading COI.csv: {e}")
         sys.exit(1)
 
+    premium_tax_rate  = load_premium_tax(province)
+    personal_tax_rate = load_personal_tax_rate(province)
+
     coi_key = f"{coi_type}-{gender}{start_age}{smk_suf}"
     if coi_key not in coi_df.columns:
         alts = [coi_key, coi_key.replace("LEVEL", "Level"), coi_key.replace("Level", "LEVEL")]
@@ -489,6 +547,7 @@ def main() -> None:
             sys.exit(1)
     coi_df[coi_key] = pd.to_numeric(coi_df[coi_key], errors="coerce").fillna(0.0)
 
+    # --- Header
     clear_status()
     if supports_ansi():
         print(f"\n\033[1;97mPOLICY REPORT ({'QC' if province=='QC' else 'ON' if province=='ON' else province} / {client_type})\033[0m")
@@ -499,7 +558,7 @@ def main() -> None:
 
     _start_dots("Calculating")
 
-
+    # --- Sim setup
     months_total = (100 - start_age) * 12
     last_m = last_coi_months(start_age, coi_type)
     monthly_rate_cache = {}
@@ -738,7 +797,7 @@ def main() -> None:
         rows_level, _, base_prem_level, notes_level = build_table_four_rates(db_option=1)
         df_level_base, _ = simulate_monthly(base_prem_level, prem_years, rate_base, db_option=1)
 
-        (Path(script_dir) / "LEVEL_Data.csv").write_text(df_level_base.to_csv(index=False))
+        (Path(reports_dir) / "LEVEL_Data.csv").write_text(df_level_base.to_csv(index=False))
 
         ann = df_level_base.copy()
         for c in ["Year", "Deposit", "TAX", "COI", "Growth", "FV_EOY"]:
@@ -762,7 +821,7 @@ def main() -> None:
 
         if client_type == "Corporate":
             out_annual["NCPI"] = ""
-            (Path(script_dir) / "LVL_Report.csv").write_text(
+            (Path(reports_dir) / "LVL_Report.csv").write_text(
                 out_annual[["Year","Age","Deposit","Income","Cost","Fund Value","Face Value","NCPI"]].to_csv(index=False)
             )
         else:
@@ -788,7 +847,7 @@ def main() -> None:
                     te_strs.append("")
             out_annual["IRR"] = irr_strs
             out_annual["TE IRR"] = te_strs
-            (Path(script_dir) / "LVL_Report.csv").write_text(
+            (Path(reports_dir) / "LVL_Report.csv").write_text(
                 out_annual[["Year","Age","Deposit","Income","Cost","Fund Value","Face Value","IRR","TE IRR"]].to_csv(index=False)
             )
 
@@ -809,8 +868,6 @@ def main() -> None:
         print(f"\n${face_amount/1_000_000:.0f}M UL (LEVEL) / {('M' if gender=='M' else 'F')}{start_age} {smk_display} / {coi_type}")
         print(f"\nANNUAL PREMIUM: ${base_prem_level:,.0f}\n")
 
-
-
     print_table_four_rates("", rows_level, [])
 
     safe_prem_level = find_min_premium_for_years(prem_years, rate_safe, db_option=1)
@@ -819,17 +876,64 @@ def main() -> None:
     else:
         print(f"\nFor reference: a guaranteed rate of {safe_rate_in:.0f}% would require {prem_years} premiums of {abbrev_money(safe_prem_level)}.\n")
 
-        # --- ALT (Alternative Investment) flow ---
+    # --- ALT (Alternative Investment) flow ---
     cg_inclusion = load_cg_inclusion(province)
 
-    # Defaults (you can modify via prompts)
-    alt_alloc_interest = 0.50   # 50%
-    alt_rate_interest  = 0.035  # 3.5%
-    alt_alloc_realized = 0.30   # 30%
-    alt_rate_realized  = 0.10   # 10.0%
-    alt_alloc_deferred = 0.20   # 20%
-    alt_rate_deferred  = 0.07   # 7.0%
+    # ---- Defaults: load from Settings/Fund.csv if present ----
+    # Expected columns (case-insensitive, flexible):
+    #   Interest_W, Interest_Rate, Realized_W, Realized_Rate, Deferred_W, Deferred_Rate, Rebalance
+    # Weights can be 0–1 or 0–100; Rates can be 0–1 or 0–100. Rebalance: 1=ON, 0=OFF
+    def _to_frac(x: float) -> float:
+        return x/100.0 if x > 1.0 else x
+
+    alt_alloc_interest = 0.50   # default 50%
+    alt_rate_interest  = 0.035  # default 3.5%
+    alt_alloc_realized = 0.30   # default 30%
+    alt_rate_realized  = 0.10   # default 10.0%
+    alt_alloc_deferred = 0.20   # default 20%
+    alt_rate_deferred  = 0.07   # default 7.0%
     alt_rebal_on       = True   # default: Rebalancing ON
+
+    fund_csv = settings_dir / "Fund.csv"
+    if fund_csv.exists():
+        try:
+            fund_df = pd.read_csv(fund_csv)
+            if len(fund_df) >= 1:
+                row = fund_df.iloc[0]
+                def get(colnames, default=None):
+                    for c in fund_df.columns:
+                        if c.strip().lower() in [n.strip().lower() for n in colnames]:
+                            v = row[c]
+                            try:
+                                return float(v)
+                            except Exception:
+                                return default
+                    return default
+
+                iw = get(["Interest_W","W_I","Weight_I","InterestWeight"], alt_alloc_interest*100)
+                ir = get(["Interest_Rate","Rate_I","R_I"], alt_rate_interest*100)
+                rw = get(["Realized_W","W_R","Weight_R","RealizedWeight"], alt_alloc_realized*100)
+                rr = get(["Realized_Rate","Rate_R","R_R"], alt_rate_realized*100)
+                dw = get(["Deferred_W","W_D","Weight_D","DeferredWeight"], alt_alloc_deferred*100)
+                dr = get(["Deferred_Rate","Rate_D","R_D"], alt_rate_deferred*100)
+                rb = get(["Rebalance","Balancing","Rebalancing"], 1.0)
+
+                alt_alloc_interest = _to_frac(iw if iw is not None else 50.0)
+                alt_rate_interest  = _to_frac(ir if ir is not None else 3.5)
+                alt_alloc_realized = _to_frac(rw if rw is not None else 30.0)
+                alt_rate_realized  = _to_frac(rr if rr is not None else 10.0)
+                alt_alloc_deferred = _to_frac(dw if dw is not None else 20.0)
+                alt_rate_deferred  = _to_frac(dr if dr is not None else 7.0)
+                alt_rebal_on       = bool(int(rb)) if rb is not None else True
+
+                # Normalize weights if they don't sum to 1
+                wsum = alt_alloc_interest + alt_alloc_realized + alt_alloc_deferred
+                if wsum > 0:
+                    alt_alloc_interest /= wsum
+                    alt_alloc_realized /= wsum
+                    alt_alloc_deferred /= wsum
+        except Exception as e:
+            print(f"Warning: couldn't parse Settings/Fund.csv ({e}). Using built-in defaults.")
 
     def show_alt(ai, ri, ar, rr, ad, rd, rb):
         def p(x): return x*100 if x <= 1 else x
@@ -842,7 +946,6 @@ def main() -> None:
             print(f"\nALT INVESTMENT REPORT ({'QC' if province=='QC' else 'ON' if province=='ON' else province} / {client_type})")
             print("-------------------------------------")
 
-        # Common lines (were accidentally inside the plain-text 'else' before)
         print(f"\n1) {p(ai):.0f}% Interest FI @ {r(ri):.1f}%")
         print(f"2) {p(ar):.0f}% Realized CG @ {r(rr):.1f}%")
         print(f"3) {p(ad):.0f}% Deferred CG @ {r(rd):.1f}%")
@@ -855,17 +958,16 @@ def main() -> None:
         alt_alloc_deferred, alt_rate_deferred,
         alt_rebal_on
     )
-    choice = read_input("To proceed press 1, to modify press 2: ").strip()
-
+    choice = (read_input("To proceed press 1, to modify press 2: ", "1").strip() or "1")
 
     while choice == "2":
         try:
-            ai = float(read_input("\n1) Fixed income allocation: ", "50").strip() or "50")
-            ri = float(read_input("   Annual rate of return: ", "3.5").strip() or "3.5")
-            ar = float(read_input("\n2) Realized CG allocation: ", "30").strip() or "30")
-            rr = float(read_input("   Annual rate of return: ", "10.0").strip() or "10.0")
-            ad = float(read_input("\n3) Deferred CG allocation: ", "20").strip() or "20")
-            rd = float(read_input("   Annual rate of return: ", "7.0").strip() or "7.0")
+            ai = float(read_input("\n1) Fixed income allocation: ", f"{alt_alloc_interest*100:.0f}").strip() or f"{alt_alloc_interest*100:.0f}")
+            ri = float(read_input("   Annual rate of return: ", f"{alt_rate_interest*100:.1f}").strip() or f"{alt_rate_interest*100:.1f}")
+            ar = float(read_input("\n2) Realized CG allocation: ", f"{alt_alloc_realized*100:.0f}").strip() or f"{alt_alloc_realized*100:.0f}")
+            rr = float(read_input("   Annual rate of return: ", f"{alt_rate_realized*100:.1f}").strip() or f"{alt_rate_realized*100:.1f}")
+            ad = float(read_input("\n3) Deferred CG allocation: ", f"{alt_alloc_deferred*100:.0f}").strip() or f"{alt_alloc_deferred*100:.0f}")
+            rd = float(read_input("   Annual rate of return: ", f"{alt_rate_deferred*100:.1f}").strip() or f"{alt_rate_deferred*100:.1f}")
             rb = read_input("\nRebalancing? (1 = Annual, 2 = Off): ", "1").strip()
 
             total_alloc = ai + ar + ad
@@ -882,14 +984,14 @@ def main() -> None:
             alt_rebal_on       = (rb == "1")
 
             show_alt(alt_alloc_interest, alt_rate_interest, alt_alloc_realized, alt_rate_realized, alt_alloc_deferred, alt_rate_deferred, alt_rebal_on)
-            choice = read_input("To proceed press 1, to modify press 2: ", "1").strip()
+            choice = (read_input("To proceed press 1, to modify press 2: ", "1").strip() or "1")
         except Exception:
             print("Invalid entry. Please try again.")
 
     if choice == "1":
-        
         horizon_age = 85
-        alt_path = Path(script_dir) / "ALT_Report.csv"
+        alt_path = Path(reports_dir) / "ALT_Report.csv"
+        rebalance_log_path = (Path(reports_dir) / "ALT_Rebalance.csv") if alt_rebal_on else None
 
         alt_df, alt_net_85 = run_alt_report(
             start_age=start_age,
@@ -906,6 +1008,7 @@ def main() -> None:
             alloc_deferred_rate=alt_rate_deferred,
             out_path=alt_path,
             rebalancing=alt_rebal_on,
+            rebalance_log_path=rebalance_log_path,
         )
 
         total_alt = alt_net_85
